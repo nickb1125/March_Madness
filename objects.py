@@ -9,177 +9,130 @@ import random
 from scipy.interpolate import UnivariateSpline
 import pickle
 from pygam import LogisticGAM, s
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import KFold, GridSearchCV
+from sklearn.metrics import make_scorer, mean_squared_error
 
-season_rankings = pd.read_csv("data/season_rankings_men.csv").query("Season >= 2003")
-season_game_results = pd.read_csv("data/game_results.csv").query("Season >= 2003")
-tourney_seeds = pd.read_csv("data/tourney_seeds.csv").query("Season >= 2003")
-tourney_results = pd.read_csv("data/tourney_results.csv").query("Season >= 2003")
+season_game_results = pd.read_csv("data/game_results.csv").query("Season >= 2010")
+tourney_seeds = pd.read_csv("data/tourney_seeds.csv").query("Season >= 2010")
+tourney_results = pd.read_csv("data/tourney_results.csv").query("Season >= 2010")
 tourney_slots = pd.read_csv("data/tourney_slots.csv")
 teams = pd.read_csv("data/teams.csv")
-all_years = tourney_seeds.Season.unique()
+all_effects = pd.read_csv("data/all_effects.csv")
+all_years = season_game_results.Season.unique()
+possible_num_games_back = [10, 15, 20]
+possible_exponential_decays = [1, 0.98, 0.95, 0.90]
 
-cache = dict({year: dict({}) for year in all_years})
-with open("cache.pickle", "rb") as handle:
-    cache = pickle.load(handle)
-
-# Potential additions: Add cross validation by year for the model,
-# Add some feature engineering
-# Add some hyperparameter tuning (including for n_games and system)
-
+cache = dict({year: 
+              dict({
+                  n_games : dict({
+                      exp_dec : dict() 
+                      for exp_dec in possible_exponential_decays}) 
+                      for n_games in possible_num_games_back}) 
+                      for year in all_years})
+#with open("cache.pickle", "rb") as handle:
+ #   cache = pickle.load(handle)
 
 class OurMod:
-    # Only a Classifer as of now, may change
-    def __init__(self):
-        self.xgb = XGBClassifier(max_depth=3)
+    def __init__(self, train_x, train_y, with_glm = False): 
+        self.kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        self.base_params = {
+            "objective": cauchy_obj,  # Updated loss parameter
+            'eval_metric':mae_eval,
+            'booster' : 'gbtree'
+        }
+        self.param_grid = {
+            'n_estimators': [700],
+            'learning_rate': [0.02],
+            'max_depth': [3],
+            'subsample' : [0.35],
+            'gamma' : [10]
+        }
+        self.xgb = XGBRegressor(**self.base_params)
+        self.train_x = train_x
+        self.train_y = train_y
+        self.spline = np.NaN
+        self.with_glm = with_glm
 
-    def fit(self, train_x, train_y):
-        self.xgb.fit(train_x, train_y)
+    def fit(self):
+        # Train Spread model
+        pre_model = XGBRegressor(**self.base_params)
+        scorer = make_scorer(mean_squared_error, greater_is_better=False)
+        grid_search = GridSearchCV(
+            estimator=pre_model,
+            param_grid=self.param_grid,
+            scoring=scorer,
+            cv=self.kf,
+            verbose=0,
+            n_jobs=-1
+        )
+        grid_search.fit(self.train_x, self.train_y)
 
-    def predict_proba(self, x):
-        pred_mov = self.xgb.predict_proba(x)
+        # print("Best Parameters: ", grid_search.best_params_)
+        best_xgb_model = grid_search.best_estimator_
+        feature_importances = best_xgb_model.feature_importances_
+        feature_importance_df = pd.DataFrame({'Feature': self.train_x.columns, 'Importance': feature_importances})
+        selected_features = feature_importance_df['Feature'].tolist()
+        X_train_subset = self.train_x[selected_features]
+
+        self.xgb = XGBRegressor(**grid_search.best_params_)
+        self.xgb.fit(X_train_subset, self.train_y)
+
+        # Train spread to prob curve (either spline or glm)
+        pred_train_mov = self.xgb.predict(self.train_x)
+        sorted_indices = np.argsort(pred_train_mov)
+        sorted_mov = pred_train_mov[sorted_indices]
+        sorted_true = [1 if x > 0 else 0 for x in self.train_y[sorted_indices]]  # Assuming self.train_y contains the true labels
+        if self.with_glm:
+            self.spline = LogisticRegression()
+            self.spline.fit(sorted_mov.reshape(-1, 1), sorted_true)
+        else:
+            self.spline = UnivariateSpline(sorted_mov, sorted_true, k=3)
+
+    def predict(self, x):
+        pred_mov = self.xgb.predict(x)
         return pred_mov
-
+    
+    def predict_proba(self, x):
+        predict_mov = self.predict(x)
+        if self.with_glm: # If GLM
+            predicted_probabilities = self.spline.predict_proba(predict_mov.reshape(-1, 1))
+            predicted_probabilities = [x[1] for x in predicted_probabilities]
+        else: # If Spline
+            predicted_probabilities = self.spline(predict_mov)
+            predicted_probabilities = [x if x < 0.975 else 0.975 for x in predicted_probabilities]
+            predicted_probabilities = [x if x > 0.025 else 0.025 for x in predicted_probabilities]
+        return predicted_probabilities
 
 class team:
     def __init__(self, team_id: int, year: int, cache=cache) -> None:
         self.team_id = team_id
         self.year = year
-        self.team_season_rank = season_rankings.query(
-            "TeamID == @team_id & Season == @year"
-        )
         self.team_game_results = season_game_results.query(
             "TeamID == @team_id & Season == @year"
         )
+        self.opp_game_results = season_game_results.query(
+            "OppTeamID == @team_id & Season == @year"
+        )
         self.cache = cache
 
-    def get_preseason_rank(self, system: str) -> int:
-        """Get preseason ranking of team."""
-        preseason_rank = (
-            self.team_season_rank.query("SystemName == @system")
-            .query("RankingDayNum == RankingDayNum.max()")
-            .reset_index(drop=1)
-            .OrdinalRank[0]
-        )
-        return preseason_rank
-
-    def get_latest_rank(self, system: str) -> int:
-        """Get current ranking of team."""
-        latest_rank = (
-            self.team_season_rank.query("SystemName == @system")
-            .query("RankingDayNum == RankingDayNum.min()")
-            .reset_index(drop=1)
-            .OrdinalRank[0]
-        )
-        return latest_rank
-
-    def get_mean_points(self):
-        return self.team_game_results.Score.mean()
-
-    def get_opp_mean_points(self):
-        return self.team_game_results.OppScore.mean()
-
-    def get_mov(self):
-        """Get season long margin of victory"""
-        return self.team_game_results.mov.mean()
-
-    def get_past_n_mov(self):
-        """Get margin of victory over last n games."""
-        return (
-            self.team_game_results.sort_values("DayNum", ascending=False)
-            .head(10)
-            .mov.mean()
-        )
-
-    def get_past_n_record(self, n: int) -> float:
+    def get_past_n_record(self, n: int, exponential_downweight : float) -> float:
         """Get (percentage) record over past 10 games"""
-        past_n_record = (
-            self.team_game_results.sort_values("DayNum", ascending=False)
-            .head(10)
-            .Result.mean()
-        )
+        past_n_record = self.team_game_results.sort_values("DayNum", ascending=False).head(n).Result
+        weights = np.array([exponential_downweight**i for i in range(len(past_n_record))])
+        past_n_record = np.array(past_n_record*weights).sum() / weights.sum()
+
         return past_n_record
 
-    def get_past_n_strength_of_schedule(self, n, system) -> float:
+    def get_strength_of_schedule(self, n, exponential_downweight : float) -> float:
         """Get average overall kempom of past n game matchups"""
-
-        ### need to fix here
-        this_season_all_rank = season_rankings.query(
-            "Season == @self.year & SystemName == @system"
-        )
-        last_n_opponents = (
-            self.team_game_results.sort_values("DayNum", ascending=False)
-            .head(10)
-            .OppTeamID
-        )
-        last_n_day_nums = (
-            self.team_game_results.sort_values("DayNum", ascending=False)
-            .head(10)
-            .DayNum
-        )
-        opp_ranks = []
-        for team, day in dict(zip(last_n_opponents, last_n_day_nums)).items():
-            try:
-                rank = (
-                    this_season_all_rank.query(
-                        "TeamID == @team & RankingDayNum <= @day"
-                    )
-                    .sort_values("RankingDayNum", ascending=False)
-                    .iloc[0]
-                    .OrdinalRank
-                )
-            except IndexError:
-                rank = (
-                    this_season_all_rank.query("TeamID == @team")
-                    .sort_values("RankingDayNum", ascending=True)
-                    .iloc[0]
-                    .OrdinalRank
-                )
-            opp_ranks.append(rank)
-        return pd.DataFrame(
-            {"past_n_games_mean_rank": [sum(opp_ranks) / len(opp_ranks)]}
-        )
-
-    def get_strength_of_schedule(self, n, system) -> float:
-        """Get average overall kempom of past n game matchups"""
-
-        ### need to fix here
-        this_season_all_rank = season_rankings.query(
-            "Season == @self.year & SystemName == @system"
-        )
         last_n_opponents = self.team_game_results.sort_values(
             "DayNum", ascending=False
-        ).OppTeamID
-        last_n_day_nums = self.team_game_results.sort_values(
-            "DayNum", ascending=False
-        ).DayNum
-        opp_ranks = []
-        for team, day in dict(zip(last_n_opponents, last_n_day_nums)).items():
-            try:
-                rank = (
-                    this_season_all_rank.query(
-                        "TeamID == @team & RankingDayNum <= @day"
-                    )
-                    .sort_values("RankingDayNum", ascending=False)
-                    .iloc[0]
-                    .OrdinalRank
-                )
-            except IndexError:
-                try:
-                    rank = (
-                        this_season_all_rank.query("TeamID == @team")
-                        .sort_values("RankingDayNum", ascending=True)
-                        .iloc[0]
-                        .OrdinalRank
-                    )
-                except:
-                    print(self.year)
-                    print(team)
-                    print(day)
-                    return IndexError("Team is not represented in ranking system")
-            opp_ranks.append(rank)
-        return pd.DataFrame(
-            {"past_n_games_mean_rank": [sum(opp_ranks) / len(opp_ranks)]}
-        )
+        ).OppTeamID.head(n)
+        opp_ranks = all_effects.query("Season==@self.year & TeamID in @last_n_opponents").reset_index(drop = 1).Effect
+        weights = np.array([exponential_downweight**i for i in range(len(opp_ranks))])
+        return np.array(opp_ranks*weights).sum() / weights.sum()
 
     def get_road_record(self) -> float:
         """Get overall road record"""
@@ -197,14 +150,10 @@ class team:
         except KeyError:
             return 17  # If either (1) tourney seeds not released or (2) team did not make tourney assign fictional seed "17"
 
-    def get_on_court_features(self):
-        court_features_mean = pd.DataFrame(
-            {
-                items[0]: [items[1]]
-                for items in dict(
-                    self.team_game_results[
-                        [
-                            "FGM",
+    def get_on_court_features(self, n_games_back, exponential_downweight):
+        num_prev = len(self.team_game_results)
+        weights = np.array([exponential_downweight**i for i in range(n_games_back)])[:num_prev]
+        desired_vars = ["FGM",
                             "FGA",
                             "FGM3",
                             "FGA3",
@@ -216,139 +165,206 @@ class team:
                             "TO",
                             "Stl",
                             "Blk",
+                            "mov"
                         ]
-                    ]
+        court_features_mean = pd.DataFrame(
+            {
+                items[0]: [items[1]]
+                for items in dict(
+                    self.team_game_results.
+                    sort_values("DayNum", ascending=False)
+                    .head(n_games_back)[desired_vars]
                     .add_suffix(f"_mean")
+                    .mul(weights, axis=0)
                     .mean()
                 ).items()
             }
         )
 
-        court_features_median = pd.DataFrame(
+        opp_court_features_mean = pd.DataFrame(
             {
                 items[0]: [items[1]]
                 for items in dict(
-                    self.team_game_results[
-                        [
-                            "FGM",
-                            "FGA",
-                            "FGM3",
-                            "FGA3",
-                            "FTM",
-                            "FTA",
-                            "OR",
-                            "DR",
-                            "Ast",
-                            "TO",
-                            "Stl",
-                            "Blk",
-                        ]
-                    ]
-                    .add_suffix(f"_median")
-                    .median()
+                    self.opp_game_results.
+                    sort_values("DayNum", ascending=False)
+                    .head(n_games_back)[desired_vars]
+                    .add_suffix(f"_opp_mean")
+                    .mul(weights, axis=0)
+                    .mean()
                 ).items()
             }
         )
 
-        court_features = pd.concat([court_features_mean, court_features_median], axis=1)
-        return court_features
+        court_features_min = pd.DataFrame(
+            {
+                items[0]: [items[1]]
+                for items in dict(
+                    self.team_game_results.
+                    sort_values("DayNum", ascending=False)
+                    .head(n_games_back)[desired_vars]
+                    .add_suffix(f"_min")
+                    .mul(weights, axis=0)
+                    .min()
+                ).items()
+            }
+        )
 
-    def collect_features(self, n_games: int, system: str):
+        opp_court_features_min = pd.DataFrame(
+            {
+                items[0]: [items[1]]
+                for items in dict(
+                    self.opp_game_results.
+                    sort_values("DayNum", ascending=False)
+                    .head(n_games_back)[desired_vars]
+                    .add_suffix(f"_opp_min")
+                    .mul(weights, axis=0)
+                    .min()
+                ).items()
+            }
+        )
+
+        court_features_max = pd.DataFrame(
+            {
+                items[0]: [items[1]]
+                for items in dict(
+                    self.team_game_results.
+                    sort_values("DayNum", ascending=False)
+                    .head(n_games_back)[desired_vars]
+                    .add_suffix(f"_max")
+                    .mul(weights, axis=0)
+                    .max()
+                ).items()
+            }
+        )
+
+        opp_court_features_max = pd.DataFrame(
+            {
+                items[0]: [items[1]]
+                for items in dict(
+                    self.opp_game_results.
+                    sort_values("DayNum", ascending=False)
+                    .head(n_games_back)[desired_vars]
+                    .add_suffix(f"_opp_max")
+                    .mul(weights, axis=0)
+                    .max()
+                ).items()
+            }
+        )
+
+        court_features = pd.concat([court_features_mean, court_features_min, opp_court_features_min,
+                                    opp_court_features_mean, court_features_max, opp_court_features_max], axis=1)
+        return court_features
+    
+    def get_mixed_effect_ranking(self):
+        """Get rankings via mixed effects model from season games"""
+        try:
+            effect = all_effects.query("Season==@self.year & TeamID == @self.team_id").Effect.reset_index(drop = 1)[0]
+        except KeyError:
+            effect = np.NaN # If team not shown in data
+        return effect
+    
+    def get_historical_mixed_effect_ranking(self, exponential_downweight):
+        """Get rankings via mixed effects model from season games"""
+        try:
+            effect = all_effects.query("Season>=@self.year-3 & TeamID == @self.team_id").Effect.values
+            weights = np.array([exponential_downweight**i for i in range(len(effect))])
+            effect = np.mean(effect*weights)
+        except KeyError:
+            effect = np.NaN # If team not shown in data
+        return effect
+
+
+    def collect_features(self, n_games: int, exponential_downweight):
         """Collect current team level modeling features"""
-        if self.team_id in self.cache.get(self.year).keys():
-            self.cache.get(self.year)[self.team_id]
+        if self.team_id in self.cache.get(self.year).get(n_games)[exponential_downweight].keys():
+            self.cache.get(self.year)[n_games][exponential_downweight][self.team_id]
         features = pd.DataFrame(
             dict(
                 {
-                    "road_record": [self.get_road_record()],
-                    "past_n_record": [self.get_past_n_record(n=n_games)],
-                    "mov": [self.get_mov()],
-                    "past_n_mov": [self.get_past_n_mov()],
-                    "get_mean_ppg": [self.get_mean_points()],
-                    "get_mean_opp_ppg": [self.get_mean_points()],
+                    "pasn_n_road_record" : [self.get_past_n_record(n=n_games, exponential_downweight=exponential_downweight)],
+                    "past_n_record": [self.get_past_n_record(n=n_games, exponential_downweight=exponential_downweight)],
                     "get_tourney_rank": [self.get_tourney_seed()],
+                    "get_team_effect":[self.get_mixed_effect_ranking()],
+                    "historical_team_effect":[self.get_historical_mixed_effect_ranking(exponential_downweight=exponential_downweight)],
+                    "get_sos" : [self.get_strength_of_schedule(n=n_games, exponential_downweight=exponential_downweight)]
                 }
             )
         )
-        gender = teams.query("TeamID == @self.team_id").reset_index(drop=1).iloc[0].M_W
-        if gender == "M":
-            append_this = pd.DataFrame(
-                {
-                    "postseason_ranking": [self.get_latest_rank(system=system)],
-                    "preseason_ranking": [self.get_preseason_rank(system=system)],
-                }
-            )
-            features = pd.concat([features, append_this], axis=1)
-        on_court_features = self.get_on_court_features()
+        on_court_features = self.get_on_court_features(n_games_back = n_games, exponential_downweight=exponential_downweight)
         features = pd.concat([features, on_court_features], axis=1)
-        self.cache.get(self.year)[self.team_id] = features
+        self.cache.get(self.year)[n_games][exponential_downweight][self.team_id] = features
         return features
 
 
 class playoff_matchup:
     def __init__(
-        self, team_id_1: int, team_id_2: int, n_games: int, system: str, cache=cache
+        self, team_id_1: int, team_id_2: int, n_games: int, exponential_downweight : float, cache=cache
     ) -> None:
         """Init playoff_matchup class."""
         team_ids = [team_id_1, team_id_2]
         self.team_id_1 = min(team_ids)  # Ensures lower team_id is the one predicted for
         self.team_id_2 = max(team_ids)
         self.n_games = n_games
-        self.system = system
+        self.exponential_downweight = exponential_downweight
         self.cache = cache
 
     def collect_features(self, year: int):
         """Collect features for playoff modeling"""
-        if not (self.team_id_1 in self.cache.get(year).keys()):
+        if not (self.team_id_1 in self.cache.get(year)[self.n_games][self.exponential_downweight].keys()):
             team_1_class = team(team_id=self.team_id_1, year=year)
             team_1_features = team_1_class.collect_features(
-                n_games=self.n_games, system=self.system
+                n_games=self.n_games,
+                exponential_downweight=self.exponential_downweight
             )
-        if not (self.team_id_2 in self.cache.get(year).keys()):
+        if not (self.team_id_2 in self.cache.get(year)[self.n_games][self.exponential_downweight].keys()):
             team_2_class = team(team_id=self.team_id_2, year=year)
             team_2_features = team_2_class.collect_features(
-                n_games=self.n_games, system=self.system
+                n_games=self.n_games,
+                exponential_downweight=self.exponential_downweight
             )
         team_1_features = pd.DataFrame(
-            self.cache.get(year).get(self.team_id_1)
+            self.cache.get(year)[self.n_games][self.exponential_downweight].get(self.team_id_1)
         ).add_suffix(f"_T1")
         team_2_features = pd.DataFrame(
-            self.cache.get(year).get(self.team_id_2)
+            self.cache.get(year)[self.n_games][self.exponential_downweight].get(self.team_id_2)
         ).add_suffix(f"_T2")
         features = pd.concat([team_1_features, team_2_features], axis=1)
+        features["seed_diff"] = features["get_tourney_rank_T1"] - features["get_tourney_rank_T2"]
+        features["effect_diff"] = features["get_team_effect_T1"] - features["get_team_effect_T2"]
         return features
 
     def predict(self, year, model):
         """Predicts probability of smaller team_id winning"""
         game_features = self.collect_features(year=year)
-        predictions = model.predict_proba(game_features)
+        predictions = model.predict(game_features)
         prob_lower_team_id = predictions[1]
         return prob_lower_team_id
 
 
 class trainer:
-    def __init__(self, n_games: int, system: str):
+    def __init__(self, n_games: int, exponential_downweight : float, with_glm = False):
         """Init class trainer."""
         self.features_men = np.NaN
         self.labels_men = np.NaN
         self.model_men = np.NaN
         self.season_key_men = np.NaN
+        self.with_glm = with_glm
+        self.exponential_downweight=exponential_downweight
 
         self.features_women = np.NaN
         self.labels_women = np.NaN
         self.model_women = np.NaN
         self.season_key_women = np.NaN
 
-        # tourney_results.Season.unique()
         self.all_years = tourney_results.Season.unique()
         self.n_games = n_games
-        self.system = system
 
     def get_features_labels(self, gender: str):
         """Gets features and labels for all years for a certain gender."""
-        all_features = pd.DataFrame()
+        all_features_list = []
         all_labels = np.array([])
         season_keys = np.array([])
+
         for year in tqdm(self.all_years):
             tourney_results_year = tourney_results.query(
                 "Season == @year & M_W == @gender"
@@ -357,21 +373,20 @@ class trainer:
                 team_ids = [row.WTeamID, row.LTeamID]
                 team_id_1 = min(team_ids)
                 if row.WTeamID == team_id_1:
-                    label = 1
+                    label = row.WScore - row.LScore
                 else:
-                    label = 0
+                    label = row.LScore - row.WScore
                 all_labels = np.append(all_labels, label)
                 matchup_class = playoff_matchup(
                     min(team_ids),
                     max(team_ids),
                     n_games=self.n_games,
-                    system=self.system,
+                    exponential_downweight=self.exponential_downweight
                 )
                 this_game_features = matchup_class.collect_features(year=row.Season)
-                all_features = pd.concat(
-                    [all_features.copy(), this_game_features.copy()]
-                )
+                all_features_list.append(this_game_features.copy())
                 season_keys = np.append(season_keys, year)
+        all_features = pd.concat(all_features_list)
         return dict(
             {
                 "all_features": all_features,
@@ -394,13 +409,13 @@ class trainer:
         self.labels_women = women["all_labels"]
         self.season_key_women = women["season_keys"]
 
-    def train(self):
+    def train(self, verbose = True):
         """Trains Models for both MNCAA and WNCAA"""
         max_year = int(self.season_key_men.max()) + 1
-        print(
-            f"Training for each year up to {max_year}. Final mens and womens model are trained on all data ip to {max_year}..."
-        )
-        for year in range(2015, max_year):
+        all_mses = []
+
+        # Hyperparameter tune
+        for year in range(2021, max_year):
             if year == 2020:
                 continue
             X_train_men, X_test_men, y_train_men, y_test_men = (
@@ -409,8 +424,8 @@ class trainer:
                 self.labels_men[self.season_key_men < year],
                 self.labels_men[self.season_key_men == year],
             )
-            self.model_men = OurMod()
-            self.model_men.fit(X_train_men, y_train_men)
+            self.model_men = OurMod(X_train_men, y_train_men, with_glm=self.with_glm)
+            self.model_men.fit()
 
             X_train_women, X_test_women, y_train_women, y_test_women = (
                 self.features_women[self.season_key_women < year],
@@ -418,47 +433,58 @@ class trainer:
                 self.labels_women[self.season_key_women < year],
                 self.labels_women[self.season_key_women == year],
             )
-            model_women = OurMod()
-            model_women.fit(X_train_women, y_train_women)
+            model_women = OurMod(X_train_women, y_train_women, with_glm=self.with_glm)
+            model_women.fit()
 
-            pred_men_prob = [x[1] for x in self.model_men.predict_proba(X_test_men)]
-            pred_women_prob = [x[1] for x in model_women.predict_proba(X_test_women)]
+            pred_men_prob = self.model_men.predict_proba(X_test_men)
+            pred_women_prob = model_women.predict_proba(X_test_women)
             pred_men_binary = [x > 0.5 for x in pred_men_prob]  # prob greater than 0.5
             pred_women_binary = [x > 0.5 for x in pred_women_prob]
-            y_test_men_binary = [x == 1 for x in y_test_men]  # mov greater than 0
-            y_test_women_binary = [x == 1 for x in y_test_women]
+            y_test_men_binary = [x > 0 for x in y_test_men]  # mov greater than 0
+            y_test_women_binary = [x > 0 for x in y_test_women]
+            pred_overall_prob, y_test_overall_binary = pred_men_prob.copy(), y_test_men_binary.copy()
+            pred_overall_prob.extend(pred_women_prob)
+            y_test_overall_binary.extend(y_test_women_binary)
+            
+            
             accuracy_men = accuracy_score(y_test_men_binary, pred_men_binary)
             mse_men = mean_squared_error(y_test_men_binary, pred_men_prob)
             log_loss_men = log_loss(y_test_men_binary, pred_men_prob)
             accuracy_women = accuracy_score(y_test_women_binary, pred_women_binary)
             mse_women = mean_squared_error(y_test_women_binary, pred_women_prob)
             log_loss_women = log_loss(y_test_women_binary, pred_women_prob)
-            print(
-                f"Mens accuracy for {year} is {round(accuracy_men * 100, 2)} percent. MSE is {round(mse_men, 6)}. Log loss is {round(log_loss_men, 6)}"
-            )
-            print(
-                f"Womens accuracy for {year} is {round(accuracy_women * 100, 2)} percent. MSE is {round(mse_women, 6)}. Log loss is {round(log_loss_women, 6)}"
-            )
+            mse_overall = mean_squared_error(y_test_overall_binary, pred_overall_prob)
+            all_mses.append(mse_overall)
+            if verbose:
+                print(
+                    f"Mens accuracy for {year} is {round(accuracy_men * 100, 2)} percent. MSE is {round(mse_men, 6)}. Log loss is {round(log_loss_men, 6)}"
+                )
+                print(
+                    f"Womens accuracy for {year} is {round(accuracy_women * 100, 2)} percent. MSE is {round(mse_women, 6)}. Log loss is {round(log_loss_women, 6)}"
+                )
+                print(
+                    f"Overall MSE for {year} is {round(mse_overall, 6)}"
+                )
         X_train_men, y_train_men = (
             self.features_men[self.season_key_men < max_year],
             self.labels_men[self.season_key_men < max_year],
         )
-        self.model_men = OurMod()
-        self.model_men.fit(X_train_men, y_train_men)
+        self.model_men = OurMod(X_train_men, y_train_men, with_glm=self.with_glm)
+        self.model_men.fit()
 
         X_train_women, y_train_women = (
             self.features_women[self.season_key_women < max_year],
             self.labels_women[self.season_key_women < max_year],
         )
-        self.model_women = OurMod()
-        self.model_women.fit(X_train_women, y_train_women)
+        self.model_women = OurMod(X_train_women, y_train_women, with_glm=self.with_glm)
+        self.model_women.fit()
+        return all_mses
 
 
 class tournament:
-    def __init__(self, year, mens_model, womens_model, n_games, system):
+    def __init__(self, year, mens_model, womens_model, n_games, exponential_downweight):
         self.year = year
         self.n_games = n_games
-        self.system = system
         self.this_year_tourney_teams_mens = tourney_seeds.query(
             "Season == @year & M_W == 'M'"
         ).TeamID
@@ -470,6 +496,7 @@ class tournament:
         self.mens_features = np.NaN
         self.womens_features = np.NaN
         self.predictions = np.NaN
+        self.exponential_downweight = exponential_downweight
 
     def predict_all_including_non_possible(self):
         """Predicts probabilities for every pair of matchups for all teams in tournement"""
@@ -477,7 +504,7 @@ class tournament:
         all_mens_matchups = list(
             itertools.combinations(
                 season_game_results.query(
-                    "Season == @self.year &  M_W == 'W'"
+                    "Season == @self.year &  M_W == 'M'"
                 ).TeamID.unique(),
                 2,
             )
@@ -503,8 +530,8 @@ class tournament:
                 team_id_1=matchup[0],
                 team_id_2=matchup[1],
                 n_games=self.n_games,
-                system=self.system,
-            )
+                exponential_downweight=self.exponential_downweight
+                )
             matchup_features = matchup_class.collect_features(year=self.year)
             mens_features = pd.concat([mens_features.copy(), matchup_features.copy()])
             matchup_string = f"{self.year}_{min(matchup_list)}_{max(matchup_list)}"
@@ -515,9 +542,8 @@ class tournament:
             matchup_class = playoff_matchup(
                 team_id_1=matchup[0],
                 team_id_2=matchup[1],
-                n_games=self.n_games,
-                system=self.system,
-            )
+                n_games=self.n_games
+                )
             matchup_features = matchup_class.collect_features(year=self.year)
             womens_features = pd.concat(
                 [womens_features.copy(), matchup_features.copy()]
@@ -530,12 +556,10 @@ class tournament:
         # predict
         mens_predictions = self.mens_model.predict_proba(mens_features)
         womens_predictions = self.womens_model.predict_proba(womens_features)
-        mens_predicitons = [predict[1] for predict in mens_predictions]
-        womens_predicitons = [predict[1] for predict in womens_predictions]
         self.predictions = pd.DataFrame(
             {
                 "ID": np.append(mens_matchup_strings, womens_matchup_strings),
-                "Pred": np.append(mens_predicitons, womens_predicitons),
+                "Pred": np.append(mens_predictions, womens_predictions),
             }
         )
         return self.predictions
@@ -608,6 +632,7 @@ class tournament:
         return updating_seed_record
 
     def get_all_possible_in_slot(self, slot, gender):
+        """Recursively retrieve all possible teams that could occupy a bracket slot."""
         all_slots = tourney_slots.query("Season == @self.year & M_W == @gender")
         tourney_seeds_this_year = tourney_seeds.query("Season == 2023 & M_W == 'M'")
         try:
@@ -755,6 +780,17 @@ class tournament:
             .round(3)
         )
         return team_chances
+    
+# Define the Cauchy objective function
+def cauchy_obj(preds, labels):
+    c = 1.0  # You can adjust this constant as per your requirement
+    grad = c * (preds - labels) / (preds**2 + 1)
+    hess = c * (1 - preds * (preds - labels)) / (preds**2 + 1)**2
+    return grad, hess
+
+def mae_eval(preds, dtrain):
+    labels = dtrain.get_label()
+    return 'mae', np.mean(np.abs(preds - labels))
 
 
 # with open('cache.pickle', 'wb') as handle:
