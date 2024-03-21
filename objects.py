@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
-from xgboost import XGBRegressor, XGBClassifier
+import xgboost as xgb
+from xgboost import XGBRegressor
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, mean_squared_error, log_loss
@@ -37,73 +38,99 @@ cache = dict({year:
 class OurMod:
     def __init__(self, train_x, train_y, with_glm = False): 
         self.kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        self.base_params = {
-            "objective": cauchy_obj,  # Updated loss parameter
-            'eval_metric':mae_eval,
-            'booster' : 'gbtree'
-        }
-        self.param_grid = {
-            'n_estimators': [700],
-            'learning_rate': [0.02],
-            'max_depth': [3],
-            'subsample' : [0.35],
-            'gamma' : [10]
-        }
-        self.xgb = XGBRegressor(**self.base_params)
+        self.param = {} 
+        self.param['eval_metric'] =  'mae'
+        self.param['booster'] = 'gbtree'
+        self.param['eta'] = 0.05 #change to ~0.02 for final run
+        self.param['subsample'] = 0.35
+        self.param['colsample_bytree'] = 0.7
+        self.param['num_parallel_tree'] = 3 #recommend 10
+        self.param['min_child_weight'] = 40
+        self.param['gamma'] = 10
+        self.param['max_depth'] =  3
+        self.xgb = np.NaN
         self.train_x = train_x
         self.train_y = train_y
         self.spline = np.NaN
         self.with_glm = with_glm
 
     def fit(self):
-        # Train Spread model
-        pre_model = XGBRegressor(**self.base_params)
-        scorer = make_scorer(mean_squared_error, greater_is_better=False)
-        grid_search = GridSearchCV(
-            estimator=pre_model,
-            param_grid=self.param_grid,
-            scoring=scorer,
-            cv=self.kf,
-            verbose=0,
-            n_jobs=-1
-        )
-        grid_search.fit(self.train_x, self.train_y)
+        # Hyperparamter Tune (With repeated folds)
+        xgb_cv = []
+        repeat_cv = 3 # recommend 10
+        dtrain = xgb.DMatrix(self.train_x.values, label = self.train_y) 
+        for i in range(repeat_cv): 
+            # print(f"Fold repeater {i}")
+            xgb_cv.append(
+                xgb.cv(
+                    params = self.param,
+                    dtrain = dtrain,
+                    obj = cauchyobj,
+                    num_boost_round = 3000,
+                    folds = KFold(n_splits = 5, shuffle = True, random_state = i),
+                    early_stopping_rounds = 25,
+                    verbose_eval=False
+                )
+            )
+        iteration_counts = [np.argmin(x['test-mae-mean'].values) for x in xgb_cv]
+        val_mae = [np.min(x['test-mae-mean'].values) for x in xgb_cv]
+        # print(f"iteration_counts : {iteration_counts}, val_mae : {val_mae}")
 
-        # print("Best Parameters: ", grid_search.best_params_)
-        best_xgb_model = grid_search.best_estimator_
-        feature_importances = best_xgb_model.feature_importances_
-        feature_importance_df = pd.DataFrame({'Feature': self.train_x.columns, 'Importance': feature_importances})
-        selected_features = feature_importance_df['Feature'].tolist()
-        X_train_subset = self.train_x[selected_features]
+        # Train model with ideal parameters (for each repeated cv from above)
+        oof_preds = []
 
-        self.xgb = XGBRegressor(**grid_search.best_params_)
-        self.xgb.fit(X_train_subset, self.train_y)
 
-        # Train spread to prob curve (either spline or glm)
-        pred_train_mov = self.xgb.predict(self.train_x)
-        sorted_indices = np.argsort(pred_train_mov)
-        sorted_mov = pred_train_mov[sorted_indices]
-        sorted_true = [1 if x > 0 else 0 for x in self.train_y[sorted_indices]]  # Assuming self.train_y contains the true labels
-        if self.with_glm:
-            self.spline = LogisticRegression()
-            self.spline.fit(sorted_mov.reshape(-1, 1), sorted_true)
-        else:
-            self.spline = UnivariateSpline(sorted_mov, sorted_true, k=3)
+        self.xgb = []
+        xgb_index = 0
+        val_true_records = {}
+        val_pred_records = {}
+        for i in range(repeat_cv):
+            # print(f"Fold repeater {i}")
+            preds = [self.train_y.copy()]
+            kfold = KFold(n_splits = 5, shuffle = True, random_state = i)  
+            for train_index, val_index in kfold.split(self.train_x.values,self.train_y):
+                dtrain_i = xgb.DMatrix(self.train_x.values[train_index], label = self.train_y[train_index])
+                dval_i = xgb.DMatrix(self.train_x.values[val_index], label = self.train_y[val_index])  
+                self.xgb.append(xgb.train(
+                    params = self.param,
+                    dtrain = dtrain_i,
+                    num_boost_round = iteration_counts[i],
+                    verbose_eval = False
+                ))
+                preds[val_index] = self.xgb[xgb_index].predict(dval_i)
+                xgb_index += 1
+            oof_preds.append(np.clip(preds,-30,30))
+        
+        # Train multiple splines with cross validation (will average results)
+        self.spline = []
+        for i in range(repeat_cv):
+            dat = list(zip(oof_preds[i],np.where(self.train_y>0,1,0)))
+            dat = sorted(dat, key = lambda x: x[0])
+            datdict = {}
+            for k in range(len(dat)):
+                datdict[dat[k][0]]= dat[k][1]
+            self.spline.append(UnivariateSpline(list(datdict.keys()), list(datdict.values())))
+            spline_fit = self.spline[i](oof_preds[i])
+            print(f"logloss of cvsplit {i}: {log_loss(np.where(self.train_y>0,1,0),spline_fit)}")
 
     def predict(self, x):
-        pred_mov = self.xgb.predict(x)
-        return pred_mov
+        x = xgb.DMatrix(x)
+        pred_mov = []
+        for i in range(len(self.xgb)):
+            pred_mov.append(np.array(self.xgb[i].predict(x)))
+        pred_mov = np.column_stack(pred_mov)
+        return np.mean(pred_mov, axis = 1)
     
     def predict_proba(self, x):
         predict_mov = self.predict(x)
-        if self.with_glm: # If GLM
-            predicted_probabilities = self.spline.predict_proba(predict_mov.reshape(-1, 1))
-            predicted_probabilities = [x[1] for x in predicted_probabilities]
-        else: # If Spline
-            predicted_probabilities = self.spline(predict_mov)
+        all_pred_prob = []
+        for i in range(len(self.spline)):
+            predicted_probabilities = self.spline[i](predict_mov)
             predicted_probabilities = [x if x < 0.975 else 0.975 for x in predicted_probabilities]
             predicted_probabilities = [x if x > 0.025 else 0.025 for x in predicted_probabilities]
-        return predicted_probabilities
+            all_pred_prob.append(np.array(predicted_probabilities))
+        all_pred_prob = np.column_stack(all_pred_prob)
+        return np.mean(all_pred_prob, axis = 1)
 
 class team:
     def __init__(self, team_id: int, year: int, cache=cache) -> None:
@@ -425,6 +452,7 @@ class trainer:
                 self.labels_men[self.season_key_men == year],
             )
             self.model_men = OurMod(X_train_men, y_train_men, with_glm=self.with_glm)
+            print("Training Mens Model")
             self.model_men.fit()
 
             X_train_women, X_test_women, y_train_women, y_test_women = (
@@ -434,10 +462,11 @@ class trainer:
                 self.labels_women[self.season_key_women == year],
             )
             model_women = OurMod(X_train_women, y_train_women, with_glm=self.with_glm)
+            print("Training Womens Model")
             model_women.fit()
 
-            pred_men_prob = self.model_men.predict_proba(X_test_men)
-            pred_women_prob = model_women.predict_proba(X_test_women)
+            pred_men_prob = self.model_men.predict_proba(X_test_men).tolist()
+            pred_women_prob = model_women.predict_proba(X_test_women).tolist()
             pred_men_binary = [x > 0.5 for x in pred_men_prob]  # prob greater than 0.5
             pred_women_binary = [x > 0.5 for x in pred_women_prob]
             y_test_men_binary = [x > 0 for x in y_test_men]  # mov greater than 0
@@ -445,6 +474,8 @@ class trainer:
             pred_overall_prob, y_test_overall_binary = pred_men_prob.copy(), y_test_men_binary.copy()
             pred_overall_prob.extend(pred_women_prob)
             y_test_overall_binary.extend(y_test_women_binary)
+
+            # log_loss(np.where(self.train_y>0,1,0),spline_fit)
             
             
             accuracy_men = accuracy_score(y_test_men_binary, pred_men_binary)
@@ -501,29 +532,27 @@ class tournament:
     def predict_all_including_non_possible(self):
         """Predicts probabilities for every pair of matchups for all teams in tournement"""
         # get all possible matchups
-        all_mens_matchups = list(
-            itertools.combinations(
-                season_game_results.query(
-                    "Season == @self.year &  M_W == 'M'"
-                ).TeamID.unique(),
-                2,
-            )
-        )
         all_womens_matchups = list(
             itertools.combinations(
-                season_game_results.query(
-                    "Season == @self.year &  M_W != 'W'"
+                tourney_seeds.query(
+                    "Season == @self.year &  M_W == 'W'"
                 ).TeamID.unique(),
                 2,
             )
         )
+        all_mens_matchups = list(
+                    itertools.combinations(
+                        tourney_seeds.query(
+                            "Season == @self.year &  M_W == 'M'"
+                        ).TeamID.unique(),
+                        2,
+                    )
+                )
 
-        # get training data for all possible matchups
-        mens_features = pd.DataFrame()
-        mens_matchup_strings = []
         womens_features = pd.DataFrame()
         womens_matchup_strings = []
-        print(f"Getting {self.year} mens tournement predicitions...")
+        mens_features = pd.DataFrame()
+        mens_matchup_strings = []
         for matchup in tqdm(all_mens_matchups):
             matchup_list = [matchup[0], matchup[1]]
             matchup_class = playoff_matchup(
@@ -536,13 +565,13 @@ class tournament:
             mens_features = pd.concat([mens_features.copy(), matchup_features.copy()])
             matchup_string = f"{self.year}_{min(matchup_list)}_{max(matchup_list)}"
             mens_matchup_strings.append(matchup_string)
-        print(f"Getting {self.year} womens tournement predicitions.")
         for matchup in tqdm(all_womens_matchups):
             matchup_list = [matchup[0], matchup[1]]
             matchup_class = playoff_matchup(
                 team_id_1=matchup[0],
                 team_id_2=matchup[1],
-                n_games=self.n_games
+                n_games=self.n_games,
+                exponential_downweight=self.exponential_downweight
                 )
             matchup_features = matchup_class.collect_features(year=self.year)
             womens_features = pd.concat(
@@ -550,10 +579,8 @@ class tournament:
             )
             matchup_string = f"{self.year}_{min(matchup_list)}_{max(matchup_list)}"
             womens_matchup_strings.append(matchup_string)
-        self.womens_features = womens_features
-        self.mens_features = mens_features
 
-        # predict
+
         mens_predictions = self.mens_model.predict_proba(mens_features)
         womens_predictions = self.womens_model.predict_proba(womens_features)
         self.predictions = pd.DataFrame(
@@ -782,15 +809,13 @@ class tournament:
         return team_chances
     
 # Define the Cauchy objective function
-def cauchy_obj(preds, labels):
-    c = 1.0  # You can adjust this constant as per your requirement
-    grad = c * (preds - labels) / (preds**2 + 1)
-    hess = c * (1 - preds * (preds - labels)) / (preds**2 + 1)**2
-    return grad, hess
-
-def mae_eval(preds, dtrain):
+def cauchyobj(preds, dtrain):
     labels = dtrain.get_label()
-    return 'mae', np.mean(np.abs(preds - labels))
+    c = 5000 
+    x =  preds-labels    
+    grad = x / (x**2/c**2+1)
+    hess = -c**2*(x**2-c**2)/(x**2+c**2)**2
+    return grad, hess
 
 
 # with open('cache.pickle', 'wb') as handle:
