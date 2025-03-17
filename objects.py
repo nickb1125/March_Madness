@@ -22,8 +22,8 @@ tourney_slots = pd.read_csv("data/tourney_slots.csv")
 teams = pd.read_csv("data/teams.csv")
 all_effects = pd.read_csv("data/all_effects.csv")
 all_years = season_game_results.Season.unique()
-possible_num_games_back = [10, 15, 20]
-possible_exponential_decays = [1, 0.98, 0.95, 0.90]
+possible_num_games_back = [15]
+possible_exponential_decays = [0.90]
 
 cache = dict({year: 
               dict({
